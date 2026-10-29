@@ -1,12 +1,21 @@
-# Nixpacks configuration for Dokploy deployment
+# nixpacks.toml para Dokploy con soporte de binarios nativos (Rolldown / esbuild / Linux x64)
 [phases.setup]
-nixPkgs = ["nodejs_22"]
+nixPkgs = [
+  "nodejs_22",
+  "stdenv.cc.cc.lib",
+  "gcc"
+]
 
 [phases.install]
-cmds = ["npm install --legacy-peer-deps"]
+cmds = [
+  "npm install --legacy-peer-deps --include=optional",
+  "npm install @rolldown/binding-linux-x64-gnu@1.2.15 --no-save || true"
+]
 
 [phases.build]
-cmds = ["npm run build"]
+cmds = [
+  "npm run build"
+]
 
 [start]
 cmd = "npm run start"
@@ -14,3 +23,4 @@ cmd = "npm run start"
 [variables]
 NODE_ENV = "production"
 PORT = "3000"
+LD_LIBRARY_PATH = "$LD_LIBRARY_PATH:/nix/var/nix/profiles/default/lib"

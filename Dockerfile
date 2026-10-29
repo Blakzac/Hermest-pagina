@@ -1,41 +1,49 @@
-# Production Dockerfile for Dokploy (React + Vite + Express Backend)
-FROM node:22-alpine AS builder
+# Production Dockerfile para Dokploy (Debian GNU/Linux x64 con compatibilidad nativa para Rolldown/esbuild)
+FROM node:22-slim AS builder
 
 WORKDIR /app
 
-# Copy dependency definitions
+# Instalar dependencias nativas del sistema si se requieren compilaciones C/C++
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    make \
+    g++ \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY package*.json ./
 COPY .npmrc ./
 
-# Install dependencies including devDependencies needed for building
-RUN npm install --legacy-peer-deps
+# Instalar dependencias forzando la inclusión de dependencias opcionales nativas
+RUN npm install --legacy-peer-deps --include=optional
 
-# Copy application source code
+# Copiar el código fuente
 COPY . .
 
-# Build the client bundle with Vite
+# Compilar frontend con Vite
 RUN npm run build
 
-# Production runner stage
-FROM node:22-alpine AS runner
+# Etapa de ejecución en producción
+FROM node:22-slim AS runner
 
 WORKDIR /app
 
 ENV NODE_ENV=production
 ENV PORT=3000
 
-# Copy package files & install production dependencies
 COPY package*.json ./
 COPY .npmrc ./
-RUN npm install --omit=dev --legacy-peer-deps && npm cache clean --force
 
-# Copy built frontend dist and server source from builder
+# Instalar solo dependencias de producción
+RUN npm install --omit=dev --legacy-peer-deps --include=optional && npm cache clean --force
+
+# Copiar archivos compilados y backend
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server.ts ./server.ts
 COPY --from=builder /app/tsconfig.json ./tsconfig.json
 COPY --from=builder /app/src ./src
 
-# Install tsx globally in runner to execute server.ts in production without full devDependencies
+# Instalar tsx para levantar server.ts
 RUN npm install -g tsx
 
 EXPOSE 3000
