@@ -1,0 +1,6 @@
+{
+  "name": "AURA - Cuerpo Digital de Agente IA",
+  "description": "Dashboard de control y cuerpo digital interactivo para agente de IA con Núcleo biométrico, interfaz de voz/texto, widgets modulares y Modo Jarvis HUD.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
