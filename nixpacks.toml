@@ -22,5 +22,5 @@ cmd = "npm run start"
 
 [variables]
 NODE_ENV = "production"
-PORT = "3000"
+PORT = "4000"
 LD_LIBRARY_PATH = "$LD_LIBRARY_PATH:/nix/var/nix/profiles/default/lib"

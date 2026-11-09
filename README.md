@@ -10,7 +10,7 @@ cp .env.example .env
 npm run dev
 ```
 
-La aplicación queda disponible en `http://localhost:3000`.
+La aplicación queda disponible en `http://localhost:4000`.
 
 ## Conectar Hermes Agent
 
