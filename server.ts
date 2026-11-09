@@ -3,6 +3,8 @@ import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
+import { spawn } from 'child_process';
+import { randomUUID } from 'crypto';
 import { GoogleGenAI } from '@google/genai';
 
 dotenv.config();
@@ -10,157 +12,606 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+type ChatRole = 'user' | 'assistant' | 'system';
+type HermesTransport = 'http' | 'process' | 'gemini' | 'local';
+type InputMode = 'text' | 'voice';
+type SSESender = (event: string, data: Record<string, unknown>) => void;
+
+interface ChatHistoryItem {
+  role: ChatRole;
+  content: string;
+}
+
+interface HermesRequestBody {
+  message?: unknown;
+  history?: unknown;
+  sessionId?: unknown;
+  inputMode?: unknown;
+}
+
+const HERMES_AGENT_URL = process.env.HERMES_AGENT_URL?.trim();
+const HERMES_AGENT_API_KEY = process.env.HERMES_AGENT_API_KEY?.trim();
+const HERMES_AGENT_COMMAND = process.env.HERMES_AGENT_COMMAND?.trim();
+const HERMES_AGENT_TIMEOUT_MS = Math.max(
+  5_000,
+  Number.parseInt(process.env.HERMES_AGENT_TIMEOUT_MS || '120000', 10) || 120_000,
+);
+const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash';
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function stripAnsi(value: string) {
+  return value.replace(/\u001b\[[0-9;]*m/g, '').replace(/\r/g, '');
+}
+
+/**
+ * Extracts the useful text from the many response shapes Hermes Agent or an
+ * OpenAI-compatible upstream may return.
+ */
+function extractUpstreamText(value: unknown, depth = 0): string {
+  if (depth > 5 || value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    return value.map((item) => extractUpstreamText(item, depth + 1)).join('');
+  }
+  if (typeof value !== 'object') return '';
+
+  const record = value as Record<string, unknown>;
+  const priorityKeys = [
+    'text',
+    'token',
+    'delta',
+    'content',
+    'response',
+    'reply',
+    'answer',
+    'output',
+    'result',
+    'message',
+    'data',
+    'choices',
+  ];
+
+  for (const key of priorityKeys) {
+    if (key in record) {
+      const extracted = extractUpstreamText(record[key], depth + 1);
+      if (extracted) return extracted;
+    }
+  }
+
+  return '';
+}
+
+function parseUpstreamSSEBlock(block: string): string {
+  const dataLines: string[] = [];
+
+  for (const rawLine of block.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith(':')) continue;
+    if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+
+  if (dataLines.length === 0) return '';
+
+  const payload = dataLines.join('\n');
+  if (payload === '[DONE]') return '';
+
+  try {
+    return extractUpstreamText(JSON.parse(payload));
+  } catch {
+    return payload;
+  }
+}
+
+async function streamFromHermesHttp(
+  message: string,
+  history: ChatHistoryItem[],
+  sessionId: string,
+  inputMode: InputMode,
+  sendSSE: SSESender,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (!HERMES_AGENT_URL) return false;
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Accept: 'text/event-stream, application/json, text/plain',
+  };
+
+  if (HERMES_AGENT_API_KEY) {
+    headers.Authorization = `Bearer ${HERMES_AGENT_API_KEY}`;
+  }
+
+  if (process.env.HERMES_AGENT_HEADERS) {
+    try {
+      const extraHeaders = JSON.parse(process.env.HERMES_AGENT_HEADERS);
+      if (extraHeaders && typeof extraHeaders === 'object' && !Array.isArray(extraHeaders)) {
+        Object.assign(headers, extraHeaders);
+      }
+    } catch (error) {
+      console.warn('HERMES_AGENT_HEADERS no es un JSON válido:', error);
+    }
+  }
+
+  const upstream = await fetch(HERMES_AGENT_URL, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      message,
+      history,
+      sessionId,
+      inputMode,
+      source: 'hermes-command-center',
+    }),
+    signal,
+  });
+
+  if (!upstream.ok) {
+    const details = (await upstream.text().catch(() => '')).slice(0, 600);
+    sendSSE('warning', {
+      message: `Hermes Agent respondió con estado HTTP ${upstream.status}.`,
+      details: details || upstream.statusText,
+    });
+    return false;
+  }
+
+  if (!upstream.body) {
+    sendSSE('warning', {
+      message: 'Hermes Agent devolvió una respuesta vacía.',
+    });
+    return false;
+  }
+
+  const contentType = upstream.headers.get('content-type') || '';
+  let emitted = false;
+
+  const emit = (text: string) => {
+    const clean = stripAnsi(text);
+    if (!clean) return;
+    emitted = true;
+    sendSSE('chunk', { text: clean });
+  };
+
+  if (contentType.includes('application/json')) {
+    const raw = await upstream.text();
+    try {
+      const parsed = JSON.parse(raw);
+      emit(extractUpstreamText(parsed) || raw);
+    } catch {
+      emit(raw);
+    }
+    return emitted;
+  }
+
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+
+  if (contentType.includes('text/event-stream')) {
+    let buffer = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split(/\r?\n\r?\n/);
+      buffer = blocks.pop() || '';
+
+      for (const block of blocks) {
+        emit(parseUpstreamSSEBlock(block));
+      }
+    }
+
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      emit(parseUpstreamSSEBlock(buffer));
+    }
+  } else {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      emit(decoder.decode(value, { stream: true }));
+    }
+    emit(decoder.decode());
+  }
+
+  return emitted;
+}
+
+function streamFromHermesProcess(
+  message: string,
+  sessionId: string,
+  inputMode: InputMode,
+  sendSSE: SSESender,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (!HERMES_AGENT_COMMAND) return Promise.resolve(false);
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let emitted = false;
+    let stderrBuffer = '';
+
+    const child = spawn(HERMES_AGENT_COMMAND, {
+      shell: true,
+      windowsHide: true,
+      env: {
+        ...process.env,
+        HERMES_MESSAGE: message,
+        HERMES_SESSION_ID: sessionId,
+        HERMES_INPUT_MODE: inputMode,
+      },
+    });
+
+    const finish = (success: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      signal.removeEventListener('abort', handleAbort);
+      resolve(success && emitted);
+    };
+
+    const handleAbort = () => {
+      if (settled) return;
+      child.kill();
+      finish(false);
+    };
+
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      if (!emitted) {
+        sendSSE('warning', {
+          message: 'El proceso de Hermes Agent excedió el tiempo máximo de respuesta.',
+        });
+      }
+      child.kill();
+      finish(false);
+    }, HERMES_AGENT_TIMEOUT_MS);
+
+    signal.addEventListener('abort', handleAbort, { once: true });
+
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
+
+    child.stdout?.on('data', (chunk: string) => {
+      const text = stripAnsi(chunk);
+      if (!text) return;
+      emitted = true;
+      sendSSE('chunk', { text });
+    });
+
+    child.stderr?.on('data', (chunk: string) => {
+      stderrBuffer = (stderrBuffer + chunk).slice(-4_000);
+    });
+
+    child.on('error', (error) => {
+      sendSSE('warning', {
+        message: 'No se pudo iniciar el proceso de Hermes Agent.',
+        details: error.message,
+      });
+      finish(false);
+    });
+
+    child.on('close', (code) => {
+      if (code !== 0 && code !== null && !emitted) {
+        sendSSE('warning', {
+          message: `El proceso de Hermes Agent finalizó con código ${code}.`,
+          details: stderrBuffer.trim() || undefined,
+        });
+      }
+      finish(code === 0);
+    });
+
+    child.stdin?.on('error', () => {
+      // The process may not read stdin. The message is still available through
+      // HERMES_MESSAGE, so this error is safe to ignore.
+    });
+    child.stdin?.write(`${message}\n`);
+    child.stdin?.end();
+  });
+}
+
+async function streamFromGemini(
+  message: string,
+  history: ChatHistoryItem[],
+  sendSSE: SSESender,
+  ai: GoogleGenAI | null,
+): Promise<boolean> {
+  if (!ai) return false;
+
+  try {
+    const contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [];
+
+    for (const item of history) {
+      if ((item.role === 'user' || item.role === 'assistant') && item.content.trim()) {
+        contents.push({
+          role: item.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text: item.content }],
+        });
+      }
+    }
+
+    contents.push({ role: 'user', parts: [{ text: message }] });
+
+    const responseStream = await ai.models.generateContentStream({
+      model: GEMINI_MODEL,
+      contents,
+      config: {
+        systemInstruction:
+          'Eres Hermes Agent, el agente operativo del centro de mando. Responde de forma directa, técnica y concisa en el idioma del operador. No inventes datos operativos ni afirmes tener acceso a sistemas que no estén conectados.',
+        temperature: 0.6,
+        maxOutputTokens: 2048,
+      },
+    });
+
+    let emitted = false;
+
+    for await (const chunk of responseStream) {
+      if (chunk.text) {
+        emitted = true;
+        sendSSE('chunk', { text: chunk.text });
+      }
+    }
+
+    return emitted;
+  } catch (error: any) {
+    console.error('Error in Gemini fallback:', error);
+    sendSSE('warning', {
+      message: 'El fallback Gemini no está disponible.',
+      details: error?.message || 'Gemini error',
+    });
+    return false;
+  }
+}
+
+function buildLocalReply(message: string, transport: HermesTransport): string {
+  const normalized = message.toLowerCase();
+  const configHint =
+    'Para enlazar el proceso real configura `HERMES_AGENT_URL` (API/SSE) o `HERMES_AGENT_COMMAND` (CLI) en el servidor.';
+
+  if (normalized.includes('ayuda') || normalized.includes('help') || normalized.includes('comando')) {
+    return [
+      '**Hermes Agent · Centro de mando**',
+      '',
+      'Puedes enviarme texto o dictar instrucciones con el micrófono. Las respuestas se transmiten en vivo por SSE.',
+      '',
+      '**Integraciones disponibles**',
+      `- Transporte activo: \`${transport}\``,
+      '- API/SSE: define `HERMES_AGENT_URL`.',
+      '- Proceso local: define `HERMES_AGENT_COMMAND` (recibe el mensaje por stdin y `HERMES_MESSAGE`).',
+      '- Fallback opcional: `GEMINI_API_KEY`.',
+      '',
+      configHint,
+    ].join('\n');
+  }
+
+  if (normalized.includes('estado') || normalized.includes('status') || normalized.includes('salud')) {
+    return [
+      '**Estado del enlace**',
+      '',
+      `- Transporte activo: \`${transport}\``,
+      `- Hora del servidor: ${new Date().toLocaleString('es-VE')}`,
+      '- Interfaz de voz: Web Speech API del navegador.',
+      '- Canal de respuesta: Server-Sent Events (SSE).',
+      '',
+      configHint,
+    ].join('\n');
+  }
+
+  if (normalized.includes('jarvis') || normalized.includes('hud')) {
+    return [
+      '**Modo HUD**',
+      '',
+      'El protocolo HUD está disponible desde el botón superior o con `Ctrl+J`. En ese modo la capa táctica muestra la última respuesta del agente y la telemetría del enlace.',
+      '',
+      'El centro de mando permanece activo en ambos modos.',
+    ].join('\n');
+  }
+
+  if (normalized.includes('hola') || normalized.includes('quién eres') || normalized.includes('quien eres')) {
+    return [
+      '**Hermes Agent en línea**',
+      '',
+      'Soy tu agente operativo. Este centro de mando está preparado para enviar instrucciones por texto o voz a un proceso Hermes externo y mostrar su respuesta en tiempo real.',
+      '',
+      configHint,
+    ].join('\n');
+  }
+
+  return [
+    '**Hermes Agent · modo local**',
+    '',
+    `Recibí tu mensaje: *"${message}"*`,
+    '',
+    `El servidor está operando sin un proceso Hermes conectado (transporte: \`${transport}\`). La interfaz, el canal de voz y el streaming ya están funcionando.`,
+    '',
+    configHint,
+  ].join('\n');
+}
+
+async function streamLocalFallback(
+  message: string,
+  transport: HermesTransport,
+  sendSSE: SSESender,
+) {
+  const response = buildLocalReply(message, transport);
+  const parts = response.split(/(\s+)/);
+
+  for (const part of parts) {
+    if (!part) continue;
+    sendSSE('chunk', { text: part });
+    await delay(12);
+  }
+}
+
 async function startServer() {
   const app = express();
-  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+  const PORT = process.env.PORT ? Number.parseInt(process.env.PORT, 10) : 3000;
 
-  app.use(express.json());
+  app.use(express.json({ limit: '1mb' }));
 
-  // Initialize Gemini client (will pick up process.env.GEMINI_API_KEY if present)
   let ai: GoogleGenAI | null = null;
   const apiKey = process.env.GEMINI_API_KEY;
   if (apiKey && apiKey !== 'MY_GEMINI_API_KEY') {
     try {
       ai = new GoogleGenAI({ apiKey });
-    } catch (err) {
-      console.warn('Error initializing GoogleGenAI:', err);
+    } catch (error) {
+      console.warn('Error initializing GoogleGenAI:', error);
     }
   }
 
-  // System instructions for the Agent Persona
-  const SYSTEM_INSTRUCTION = `Eres AURA (Autonomous Unified Resilient Agent), el cuerpo digital y núcleo de operaciones inteligente.
-Posees control y visibilidad en tiempo real sobre los siguientes módulos:
-1. Gestión de Gandolas y Logística: Monitoreo de rutas, combustible, carga y telemetría de flota de transporte pesado (valencia, maracay, puerto cabello, caracas).
-2. Auditoría iDempiere: Supervisión continua de ERP, conciliación bancaria, asientos contables pendientes, detección de discrepancias e inventarios.
-3. Estado de Red e Infraestructura: Latencia, nodos de servidores, firewall perimetral y ancho de banda.
+  const resolveTransport = (): HermesTransport => {
+    if (HERMES_AGENT_URL) return 'http';
+    if (HERMES_AGENT_COMMAND) return 'process';
+    if (ai) return 'gemini';
+    return 'local';
+  };
 
-Tu tono es profesional, analítico, conciso y de alta precisión tecnológica, similar a una IA táctica ejecutiva (estilo Jarvis).
-Responde en español a menos que el usuario pregunte en otro idioma. Puedes estructurar respuestas con viñetas clave, datos operativos y sugerencias de acción directa.`;
-
-  // Health endpoint
-  app.get('/api/health', (req: Request, res: Response) => {
+  app.get('/api/health', (_req: Request, res: Response) => {
     res.json({
       status: 'operational',
-      model: 'gemini-3.8-flash',
-      geminiConfigured: !!(apiKey && apiKey !== 'MY_GEMINI_API_KEY'),
-      timestamp: new Date().toISOString()
+      service: 'hermes-command-center',
+      transport: resolveTransport(),
+      hermes: {
+        configured: Boolean(HERMES_AGENT_URL || HERMES_AGENT_COMMAND),
+        httpConfigured: Boolean(HERMES_AGENT_URL),
+        processConfigured: Boolean(HERMES_AGENT_COMMAND),
+      },
+      geminiConfigured: Boolean(ai),
+      model: GEMINI_MODEL,
+      uptimeSeconds: Math.round(process.uptime()),
+      timestamp: new Date().toISOString(),
     });
   });
 
-  // Streaming endpoint for Gemini prompts
-  app.post('/api/gemini/stream', async (req: Request, res: Response) => {
-    const { message, history = [], activeWidgets = [] } = req.body;
+  const handleHermesStream = async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as HermesRequestBody;
+    const message = typeof body.message === 'string' ? body.message.trim() : '';
+    const sessionId =
+      typeof body.sessionId === 'string' && body.sessionId.trim()
+        ? body.sessionId.trim()
+        : randomUUID();
+    const inputMode: InputMode = body.inputMode === 'voice' ? 'voice' : 'text';
 
-    if (!message || typeof message !== 'string') {
-      res.status(400).json({ error: 'Mensaje requerido' });
+    if (!message) {
+      res.status(400).json({ error: 'El campo message es requerido.' });
       return;
     }
 
-    // Prepare SSE headers
+    if (message.length > 8_000) {
+      res.status(413).json({ error: 'El mensaje excede el límite de 8000 caracteres.' });
+      return;
+    }
+
+    const history: ChatHistoryItem[] = Array.isArray(body.history)
+      ? body.history
+          .filter(
+            (item): item is ChatHistoryItem =>
+              Boolean(item) &&
+              typeof item === 'object' &&
+              ['user', 'assistant', 'system'].includes((item as ChatHistoryItem).role) &&
+              typeof (item as ChatHistoryItem).content === 'string' &&
+              Boolean((item as ChatHistoryItem).content.trim()),
+          )
+          .slice(-24)
+          .map((item) => ({
+            role: item.role,
+            content: item.content.slice(0, 8_000),
+          }))
+      : [];
+
     res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
 
-    const sendSSE = (event: string, data: any) => {
+    const sendSSE: SSESender = (event, data) => {
+      if (res.writableEnded) return;
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     };
 
-    // If Gemini API is available and valid
-    if (ai) {
-      try {
-        // Format history for @google/genai
-        const contents = [];
-        
-        // Context info about active widgets
-        const contextPrompt = activeWidgets.length > 0 
-          ? `[Contexto del Sistema: Módulos activos en el Dashboard: ${activeWidgets.join(', ')}]`
-          : '';
+    const abortController = new AbortController();
+    res.on('close', () => {
+      if (!res.writableEnded) abortController.abort();
+    });
 
-        for (const item of history) {
-          if (item.role === 'user' || item.role === 'assistant') {
-            contents.push({
-              role: item.role === 'assistant' ? 'model' : 'user',
-              parts: [{ text: item.content }]
-            });
-          }
-        }
+    const transport = resolveTransport();
+    sendSSE('meta', {
+      sessionId,
+      transport,
+      inputMode,
+      timestamp: new Date().toISOString(),
+    });
 
-        // Add current user message with system context if first turn or relevant
-        contents.push({
-          role: 'user',
-          parts: [{ text: contextPrompt ? `${contextPrompt}\n\n${message}` : message }]
-        });
-
-        const responseStream = await ai.models.generateContentStream({
-          model: 'gemini-3.8-flash',
-          contents,
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-            temperature: 0.7,
-            maxOutputTokens: 2048,
-          }
-        });
-
-        for await (const chunk of responseStream) {
-          const text = chunk.text;
-          if (text) {
-            sendSSE('chunk', { text });
-          }
-        }
-
-        sendSSE('done', { completed: true });
-        res.end();
-        return;
-      } catch (err: any) {
-        console.error('Error in Gemini generateContentStream:', err);
-        sendSSE('warning', {
-          message: 'Error al conectar con Gemini API. Activando modo autónomo local de respaldo.',
-          details: err?.message || 'Gemini error'
-        });
-      }
-    }
-
-    // Fallback autonomous local intelligent agent simulation
-    // This guarantees the UI is 100% interactive and functional even without an API key
     try {
-      const lower = message.toLowerCase();
-      let responseText = '';
+      let hadOutput = false;
 
-      if (lower.includes('gandola') || lower.includes('flota') || lower.includes('camion') || lower.includes('transporte')) {
-        responseText = `🚛 **Reporte de Flota de Gandolas Activas:**\n\n- **Unidad G-104 (Volvo FH16):** En tránsito hacia Puerto Cabello. Carga: 28 Ton granos. Combustible: 76%. Velocidad: 68 km/h. Sin anomalías mecánicas.\n- **Unidad G-208 (Mack Titan):** Retenido en Peaje La Cabrera por control de pesaje. Estimado de liberación: 18 min.\n- **Unidad G-315 (Freightliner):** Descargando en Almacén Central Valencia. Retorno programado para las 14:30.\n\n*Recomendación AURA:* Mantener monitoreo de telemetría GPS en ruta 1 y autorizar guía de despacho digital para G-315.`;
-      } else if (lower.includes('idempiere') || lower.includes('auditor') || lower.includes('contab') || lower.includes('erp') || lower.includes('concili')) {
-        responseText = `📊 **Auditoría del Sistema iDempiere ERP:**\n\n- **Estado de Servidor:** Online y sincronizado con base de datos PostgreSQL.\n- **Conciliación Bancaria:** 94% completada para el ciclo actual. Se detectaron 2 movimientos no conciliados en cuenta Banco Nacional (Ref: #TR-88412 por $4,120.00).\n- **Asientos Contables:** 1,420 procesados hoy, 0 rechazados.\n- **Discrepancias de Inventario:** Nivel de tolerancia normal (+/- 0.4%).\n\n*Acción recomendada:* Puedo ejecutar la macro de conciliación automática para las transacciones validadas.`;
-      } else if (lower.includes('red') || lower.includes('ping') || lower.includes('servidor') || lower.includes('firewall') || lower.includes('infraestructura')) {
-        responseText = `🌐 **Diagnóstico de Red e Infraestructura:**\n\n- **Latencia promedio:** 24ms (Excelente)\n- **Ancho de banda activo:** 428 Mbps de bajada / 112 Mbps de subida\n- **Nodos del Clúster:** 3/3 en estado HEALTHY (Nodo-Caracas, Nodo-Valencia, Nodo-CloudUS)\n- **Firewall Perimetral:** Activo. 14 escaneos de puertos bloqueados en la última hora.\n- **Pérdida de paquetes:** 0.01%\n\nTodo el ecosistema de comunicaciones opera dentro de los umbrales seguros.`;
-      } else if (lower.includes('jarvis') || lower.includes('hud') || lower.includes('tactico')) {
-        responseText = `🕶️ **Modo JARVIS Inicializado:**\n\nActivando matrices holográficas, HUD de alta densidad y telemetría en tiempo real. Todos los sensores biométricos del Núcleo están calibrados en frecuencia óptima.\n\nPuedes alternar el switch en la barra superior o presionar el botón de Modo Jarvis para visualizar la cabina táctica completa.`;
-      } else if (lower.includes('hola') || lower.includes('quien eres') || lower.includes('que puedes hacer')) {
-        responseText = `Saludos. Soy **AURA**, tu interfaz y cuerpo digital autónomo.\n\nEstoy enlazado a tus herramientas operativas:\n1. 🚛 **Gestión de Gandolas**: Rastreo satelital y estatus de fletes.\n2. 📊 **Auditoría iDempiere**: Verificación de integridad financiera y balance ERP.\n3. 🌐 **Telemetría de Red**: Supervisión de latencia y nodos.\n\nPuedes hablarme mediante voz con el botón de micrófono, escribir cualquier instrucción o reorganizar tus widgets según tu flujo de trabajo. ¿Qué operación deseas revisar?`;
-      } else {
-        responseText = `Comprendido. He procesado tu solicitud: *"${message}"*.\n\nTodos los módulos de soporte han sincronizado el evento con el Núcleo. Si deseas profundizar en análisis de rutas de gandolas, conciliaciones en iDempiere o estados de enlace de red, indícame la variable específica o haz clic en los widgets interactivos del tablero.`;
+      if (transport === 'http') {
+        try {
+          hadOutput = await streamFromHermesHttp(
+            message,
+            history,
+            sessionId,
+            inputMode,
+            sendSSE,
+            abortController.signal,
+          );
+        } catch (error: any) {
+          if (abortController.signal.aborted) {
+            sendSSE('done', { completed: false, aborted: true });
+            res.end();
+            return;
+          }
+          console.error('Hermes HTTP bridge error:', error);
+          sendSSE('warning', {
+            message: 'No se pudo contactar el endpoint HTTP de Hermes Agent.',
+            details: error?.message || 'Error de red',
+          });
+        }
+      } else if (transport === 'process') {
+        hadOutput = await streamFromHermesProcess(
+          message,
+          sessionId,
+          inputMode,
+          sendSSE,
+          abortController.signal,
+        );
+      } else if (transport === 'gemini') {
+        hadOutput = await streamFromGemini(message, history, sendSSE, ai);
       }
 
-      // Stream fake chunks with natural typing speed
-      const words = responseText.split(' ');
-      for (let i = 0; i < words.length; i++) {
-        const chunk = (i === 0 ? '' : ' ') + words[i];
-        sendSSE('chunk', { text: chunk });
-        await new Promise((r) => setTimeout(r, 25));
+      if (!hadOutput && !abortController.signal.aborted) {
+        await streamLocalFallback(message, transport, sendSSE);
       }
 
-      sendSSE('done', { completed: true });
-      res.end();
-    } catch (simErr) {
-      console.error('Simulation error:', simErr);
-      res.end();
+      sendSSE('done', {
+        completed: true,
+        transport,
+        aborted: abortController.signal.aborted,
+      });
+    } catch (error: any) {
+      console.error('Hermes stream error:', error);
+      sendSSE('error', {
+        message: 'El enlace con Hermes Agent se interrumpió.',
+        details: error?.message || 'Error interno',
+      });
+    } finally {
+      if (!res.writableEnded) res.end();
     }
-  });
+  };
 
-  // Vite integration
+  app.post('/api/hermes/stream', handleHermesStream);
+
+  // Alias legacy: mantiene compatibilidad con clientes anteriores.
+  app.post('/api/gemini/stream', handleHermesStream);
+
   if (process.env.NODE_ENV === 'production') {
     app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (req: Request, res: Response) => {
+    app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
     });
   } else {
@@ -172,10 +623,11 @@ Responde en español a menos que el usuario pregunte en otro idioma. Puedes estr
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`AURA Server running on http://0.0.0.0:${PORT}`);
+    console.log(`Hermes Command Center running on http://0.0.0.0:${PORT}`);
+    console.log(`Hermes transport: ${resolveTransport()}`);
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
+startServer().catch((error) => {
+  console.error('Failed to start server:', error);
 });

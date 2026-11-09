@@ -1,6 +1,6 @@
 {
-  "name": "AURA - Cuerpo Digital de Agente IA",
-  "description": "Dashboard de control y cuerpo digital interactivo para agente de IA con Núcleo biométrico, interfaz de voz/texto, widgets modulares y Modo Jarvis HUD.",
-  "requestFramePermissions": [],
+  "name": "HERMES - Centro de Mando",
+  "description": "Centro de mando conversacional para interactuar con Hermes Agent por texto o voz, con streaming en tiempo real y HUD táctico.",
+  "requestFramePermissions": ["microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

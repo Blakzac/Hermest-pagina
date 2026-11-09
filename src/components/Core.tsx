@@ -10,6 +10,7 @@ interface CoreProps {
   isJarvisMode?: boolean;
   audioLevel?: number; // 0 to 1 for reactive voice animation
   bpm?: number;
+  compact?: boolean;
 }
 
 export const Core: React.FC<CoreProps> = ({
@@ -18,6 +19,7 @@ export const Core: React.FC<CoreProps> = ({
   isJarvisMode = false,
   audioLevel = 0,
   bpm = 72,
+  compact = false,
 }) => {
   // Color configuration depending on state
   const stateTheme = useMemo(() => {
@@ -102,9 +104,9 @@ export const Core: React.FC<CoreProps> = ({
   };
 
   return (
-    <div className="relative flex flex-col items-center justify-center p-4">
+    <div className={compact ? 'relative flex items-center justify-center' : 'relative flex flex-col items-center justify-center p-4'}>
       {/* HUD Reticle Overlay for Jarvis Mode */}
-      {isJarvisMode && (
+      {isJarvisMode && !compact && (
         <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
           <div className="w-[340px] h-[340px] border border-cyan-500/20 rounded-full border-dashed animate-spin" style={{ animationDuration: '60s' }} />
           <div className="absolute w-[380px] h-[380px] border border-cyan-500/10 rounded-full" />
@@ -123,7 +125,9 @@ export const Core: React.FC<CoreProps> = ({
       <div 
         onClick={handleCoreClick}
         title="Haz clic para alternar el estado del Núcleo"
-        className="relative w-64 h-64 md:w-72 md:h-72 flex items-center justify-center cursor-pointer select-none group"
+        className={`relative flex items-center justify-center cursor-pointer select-none group ${
+          compact ? 'w-14 h-14' : 'w-64 h-64 md:w-72 md:h-72'
+        }`}
       >
         {/* Outer Glow Aura */}
         <motion.div
@@ -155,7 +159,7 @@ export const Core: React.FC<CoreProps> = ({
         <motion.div
           animate={{ rotate: -360 }}
           transition={{ duration: 24 / stateTheme.speed, repeat: Infinity, ease: 'linear' }}
-          className="absolute inset-5 rounded-full border border-dashed border-cyan-400/30"
+          className={`absolute rounded-full border border-dashed border-cyan-400/30 ${compact ? 'inset-1' : 'inset-5'}`}
         >
           <div className="absolute top-1/2 right-0 -translate-y-1/2 w-2 h-2 rounded-full bg-purple-400 shadow-[0_0_8px_#c084fc]" />
         </motion.div>
@@ -164,7 +168,7 @@ export const Core: React.FC<CoreProps> = ({
         <motion.div
           animate={{ rotate: 360 }}
           transition={{ duration: 16 / stateTheme.speed, repeat: Infinity, ease: 'linear' }}
-          className="absolute inset-10 rounded-full border border-slate-700/60"
+          className={`absolute rounded-full border border-slate-700/60 ${compact ? 'inset-2' : 'inset-10'}`}
         >
           <div className="w-full h-full rounded-full border-t border-r border-cyan-400/60" />
         </motion.div>
@@ -180,7 +184,7 @@ export const Core: React.FC<CoreProps> = ({
             repeat: Infinity,
             ease: 'easeOut',
           }}
-          className={`absolute inset-8 rounded-full border-2 ${stateTheme.border} pointer-events-none`}
+          className={`absolute rounded-full border-2 ${stateTheme.border} pointer-events-none ${compact ? 'inset-1' : 'inset-8'}`}
         />
 
         {/* Core Inner Sphere (The "Biometric Heart") */}
@@ -202,7 +206,9 @@ export const Core: React.FC<CoreProps> = ({
             repeat: Infinity,
             ease: 'easeInOut',
           }}
-          className={`relative z-10 w-28 h-28 md:w-32 md:h-32 rounded-full bg-gradient-to-br ${stateTheme.color} p-[2px] transition-colors duration-500`}
+          className={`relative z-10 rounded-full bg-gradient-to-br ${stateTheme.color} p-[2px] transition-colors duration-500 ${
+            compact ? 'w-8 h-8' : 'w-28 h-28 md:w-32 md:h-32'
+          }`}
         >
           {/* Inner dark refraction chamber */}
           <div className="w-full h-full rounded-full bg-[#070b14] flex flex-col items-center justify-center relative overflow-hidden backdrop-blur-md">
@@ -225,58 +231,64 @@ export const Core: React.FC<CoreProps> = ({
               }}
               className="z-10"
             >
-              <Icon className={`w-8 h-8 md:w-9 md:h-9 ${stateTheme.textColor} drop-shadow-[0_0_12px_currentColor]`} />
+              <Icon className={`${compact ? 'w-4 h-4' : 'w-8 h-8 md:w-9 md:h-9'} ${stateTheme.textColor} drop-shadow-[0_0_12px_currentColor]`} />
             </motion.div>
 
             {/* Heartbeat pulse label */}
-            <div className="z-10 mt-1 flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping" />
-              <span className={`text-[10px] font-mono-code tracking-widest font-bold ${stateTheme.textColor}`}>
-                {state === 'processing' ? 'BUSY' : `${bpm} BPM`}
-              </span>
-            </div>
+            {!compact && (
+              <div className="z-10 mt-1 flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping" />
+                <span className={`text-[10px] font-mono-code tracking-widest font-bold ${stateTheme.textColor}`}>
+                  {state === 'processing' ? 'BUSY' : `${bpm} BPM`}
+                </span>
+              </div>
+            )}
           </div>
         </motion.div>
 
         {/* Hover Hint */}
-        <div className="absolute -bottom-1 opacity-0 group-hover:opacity-100 transition-opacity text-[10px] text-cyan-400/80 font-mono-code uppercase tracking-wider bg-slate-900/90 px-2 py-0.5 rounded border border-cyan-500/30">
-          Clic: Probar Estado
-        </div>
+        {!compact && (
+          <div className="absolute -bottom-1 opacity-0 group-hover:opacity-100 transition-opacity text-[10px] text-cyan-400/80 font-mono-code uppercase tracking-wider bg-slate-900/90 px-2 py-0.5 rounded border border-cyan-500/30">
+            Clic: Probar Estado
+          </div>
+        )}
       </div>
 
       {/* State Badge & Details */}
-      <div className="mt-3 text-center flex flex-col items-center gap-1 z-20">
-        <div className="flex items-center gap-2">
-          <span className={`px-2.5 py-0.5 text-xs font-hud font-bold rounded-full border ${stateTheme.bgBadge} tracking-wider shadow-sm flex items-center gap-1.5`}>
-            <span className="w-2 h-2 rounded-full bg-current animate-pulse" />
-            {stateTheme.label}
-          </span>
-        </div>
-        <p className="text-xs text-slate-400 font-mono-code">
-          {stateTheme.subLabel}
-        </p>
+      {!compact && (
+        <div className="mt-3 text-center flex flex-col items-center gap-1 z-20">
+          <div className="flex items-center gap-2">
+            <span className={`px-2.5 py-0.5 text-xs font-hud font-bold rounded-full border ${stateTheme.bgBadge} tracking-wider shadow-sm flex items-center gap-1.5`}>
+              <span className="w-2 h-2 rounded-full bg-current animate-pulse" />
+              {stateTheme.label}
+            </span>
+          </div>
+          <p className="text-xs text-slate-400 font-mono-code">
+            {stateTheme.subLabel}
+          </p>
 
-        {/* Quick State Selector Buttons */}
-        <div className="flex flex-wrap items-center justify-center gap-1.5 mt-2">
-          {(['online', 'processing', 'speaking', 'idle'] as AgentState[]).map((st) => (
-            <button
-              key={st}
-              onClick={(e) => {
-                e.stopPropagation();
-                playBlip(950, 0.04);
-                onStateChange?.(st);
-              }}
-              className={`text-[11px] font-mono-code uppercase px-2 py-1 rounded transition-all ${
-                state === st
-                  ? 'bg-cyan-500/30 text-cyan-300 border border-cyan-400 font-bold shadow-[0_0_10px_rgba(6,182,212,0.3)]'
-                  : 'bg-slate-900/60 text-slate-400 border border-slate-800 hover:border-slate-600 hover:text-slate-200'
-              }`}
-            >
-              {st === 'online' ? '● Online' : st === 'processing' ? '⚡ Procesando' : st === 'speaking' ? '🔊 Habla' : '💤 Reposo'}
-            </button>
-          ))}
+          {/* Quick State Selector Buttons */}
+          <div className="flex flex-wrap items-center justify-center gap-1.5 mt-2">
+            {(['online', 'processing', 'speaking', 'idle'] as AgentState[]).map((st) => (
+              <button
+                key={st}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  playBlip(950, 0.04);
+                  onStateChange?.(st);
+                }}
+                className={`text-[11px] font-mono-code uppercase px-2 py-1 rounded transition-all ${
+                  state === st
+                    ? 'bg-cyan-500/30 text-cyan-300 border border-cyan-400 font-bold shadow-[0_0_10px_rgba(6,182,212,0.3)]'
+                    : 'bg-slate-900/60 text-slate-400 border border-slate-800 hover:border-slate-600 hover:text-slate-200'
+                }`}
+              >
+                {st === 'online' ? '● Online' : st === 'processing' ? '⚡ Procesando' : st === 'speaking' ? '🔊 Habla' : '💤 Reposo'}
+              </button>
+            ))}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };
