@@ -463,13 +463,13 @@ async function startServer() {
     }
   }
 
-    const resolveTransport = (): HermesTransport => {
-    // Priorizamos el proceso local si está configurado
-    if (HERMES_AGENT_COMMAND) return 'process';
-    if (HERMES_AGENT_URL) return 'http';
+      const resolveTransport = (): HermesTransport => {
+    // Si tienes Gemini configurado, lo usamos como opción principal para hablar
     if (ai) return 'gemini';
+    // Si no, caemos a local
     return 'local';
   };
+
 
 
   app.get('/api/health', (_req: Request, res: Response) => {
